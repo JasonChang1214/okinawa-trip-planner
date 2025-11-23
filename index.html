@@ -1,0 +1,809 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>旅遊行程與記帳App - 沖繩五日遊</title>
+    <!-- 載入 Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 載入 React, ReactDOM, and Babel CDNs -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <!-- 修正: 載入 Lucide Icons UMD 版本。它會將所有 Icon 暴露給全域 lucide 變數 -->
+    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+
+    <!-- 載入 Firebase CDNs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { 
+            getFirestore, 
+            collection, 
+            query, 
+            onSnapshot, 
+            addDoc, 
+            deleteDoc, 
+            doc, 
+            serverTimestamp, 
+            setLogLevel, 
+            setDoc
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // 將所有 Firebase 模組賦予給 window 物件，以便在 Babel 腳本中訪問
+        window.Firebase = {
+            initializeApp, 
+            getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged,
+            getFirestore, collection, query, onSnapshot, addDoc, deleteDoc, doc, 
+            serverTimestamp, setLogLevel, setDoc
+        };
+    </script>
+    
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .text-shadow-md {
+            text-shadow: 1px 1px 2px rgba(0,0,0,0.5);
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        // 此處開始使用 React/JSX 語法
+        const { useState, useEffect, useCallback, useMemo } = React;
+        const { 
+            initializeApp, getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged,
+            getFirestore, collection, query, onSnapshot, addDoc, deleteDoc, doc, 
+            serverTimestamp, setLogLevel, setDoc
+        } = window.Firebase;
+
+        // 修正: 直接從全域 lucide 物件解構 Icon 函式
+        const { Map, DollarSign, ListChecks, Plus, Trash2, Bus, Compass, Menu } = window.lucide;
+
+        // --- Firebase Configuration and Setup (MANDATORY) ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        const OKINAWA_BANNER_URL = "https://placehold.co/1200x300/30a7d7/ffffff/png?text=Okinawa+Trip";
+        const OKINAWA_BANNER_ALT = "沖繩海岸風景圖";
+
+        // The main application component
+        const App = () => {
+          // State for Firebase and user
+          const [db, setDb] = useState(null);
+          const [auth, setAuth] = useState(null);
+          const [userId, setUserId] = useState(null);
+          const [isAuthReady, setIsAuthReady] = useState(false);
+
+          // Application specific state
+          const [itineraries, setItineraries] = useState([]);
+          const [expenses, setExpenses] = useState([]);
+          const [view, setView] = useState('itinerary'); // 'itinerary' or 'expenses'
+          const [loading, setLoading] = useState(true);
+          const [error, setError] = useState(null);
+          const [isMenuOpen, setIsMenuOpen] = useState(false); 
+          const [dataInitialized, setDataInitialized] = useState(false); 
+
+          // 1. Initialize Firebase and Auth
+          useEffect(() => {
+            try {
+              if (Object.keys(firebaseConfig).length === 0) {
+                setError("Firebase配置未載入。請檢查環境設定。");
+                setLoading(false);
+                return;
+              }
+
+              setLogLevel('debug'); 
+
+              const app = initializeApp(firebaseConfig);
+              const firestoreDb = getFirestore(app);
+              const firebaseAuth = getAuth(app);
+
+              setDb(firestoreDb);
+              setAuth(firebaseAuth);
+
+              const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
+                if (user) {
+                  setUserId(user.uid);
+                  setIsAuthReady(true);
+                } else if (initialAuthToken) {
+                  try {
+                    await signInWithCustomToken(firebaseAuth, initialAuthToken);
+                  } catch (e) {
+                    console.error("Custom token sign-in failed, trying anonymous:", e);
+                    await signInAnonymously(firebaseAuth);
+                  }
+                } else {
+                  await signInAnonymously(firebaseAuth);
+                }
+              });
+
+              return () => unsubscribe();
+            } catch (e) {
+              console.error("Firebase Initialization Error:", e);
+              setError("初始化失敗：" + e.message);
+              setLoading(false);
+            }
+          }, []);
+
+          // Utility to get the public collection path
+          const getPublicCollectionPath = (collectionName) => {
+            return `artifacts/${appId}/public/data/${collectionName}`;
+          };
+
+          // 2. Realtime Data Listener (Itineraries and Expenses)
+          useEffect(() => {
+            if (!isAuthReady || !db) return;
+
+            let unsubItineraries, unsubExpenses;
+
+            // Listener for Itineraries (行程)
+            const itineraryCollectionRef = collection(db, getPublicCollectionPath('itineraries'));
+            const qItineraries = query(itineraryCollectionRef);
+            unsubItineraries = onSnapshot(qItineraries, (snapshot) => {
+              const plans = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data(),
+                activities: doc.data().activities || [], 
+              })).sort((a, b) => a.dayNumber - b.dayNumber); 
+              setItineraries(plans);
+              if (plans.length > 0) {
+                setDataInitialized(true);
+              }
+              setLoading(false);
+            }, (e) => {
+              console.error("Itinerary Snapshot Error:", e);
+              setError("行程資料載入失敗: " + e.message);
+              setLoading(false);
+            });
+
+            // Listener for Expenses (記帳)
+            const expenseCollectionRef = collection(db, getPublicCollectionPath('expenses'));
+            const qExpenses = query(expenseCollectionRef);
+            unsubExpenses = onSnapshot(qExpenses, (snapshot) => {
+              const items = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data(),
+                amount: Number(doc.data().amount), 
+              }));
+              setExpenses(items);
+              setLoading(false);
+            }, (e) => {
+              console.error("Expense Snapshot Error:", e);
+              setError("記帳資料載入失敗: " + e.message);
+              setLoading(false);
+            });
+
+            return () => {
+              unsubItineraries && unsubItineraries();
+              unsubExpenses && unsubExpenses();
+            };
+          }, [isAuthReady, db]);
+
+
+          // --- Itinerary Functions (行程規劃) ---
+
+          const addDailyPlan = useCallback(async (dayNumber, title, activities = []) => {
+            if (!db || !userId) return;
+            const planRef = collection(db, getPublicCollectionPath('itineraries'));
+            try {
+              await addDoc(planRef, {
+                dayNumber: Number(dayNumber),
+                title,
+                activities: activities.map(activity => ({
+                  ...activity,
+                  id: Date.now().toString() + Math.random(),
+                  addedBy: userId,
+                  timestamp: serverTimestamp(),
+                })).sort((a, b) => (a.time || "").localeCompare(b.time || "")),
+                createdAt: serverTimestamp(),
+                createdBy: userId,
+              });
+            } catch (e) {
+              console.error("Error adding daily plan: ", e);
+            }
+          }, [db, userId]);
+
+          const addActivityToPlan = useCallback(async (planId, activityTime, activityName, location) => {
+            if (!db || !userId) return;
+            const planDocRef = doc(db, getPublicCollectionPath('itineraries'), planId);
+            try {
+              const plan = itineraries.find(p => p.id === planId);
+              if (!plan) return;
+
+              const newActivity = {
+                id: Date.now().toString() + Math.random(), 
+                time: activityTime,
+                name: activityName,
+                location,
+                addedBy: userId,
+                timestamp: serverTimestamp(),
+              };
+
+              await setDoc(planDocRef, {
+                ...plan,
+                activities: [...(plan.activities || []), newActivity].sort((a, b) => (a.time || "").localeCompare(b.time || "")),
+              }, { merge: true }); 
+
+            } catch (e) {
+              console.error("Error adding activity: ", e);
+            }
+          }, [db, userId, itineraries]);
+
+          const deleteItinerary = useCallback(async (planId) => {
+            if (!db) return;
+            const planDocRef = doc(db, getPublicCollectionPath('itineraries'), planId);
+            try {
+              await deleteDoc(planDocRef);
+            } catch (e) {
+              console.error("Error deleting itinerary: ", e);
+            }
+          }, [db]);
+
+          // --- Expense Functions (記帳系統) ---
+
+          const addExpense = useCallback(async (description, amount, currency = 'TWD', note = '') => {
+            if (!db || !userId) return;
+            const expenseRef = collection(db, getPublicCollectionPath('expenses'));
+            try {
+              await addDoc(expenseRef, {
+                description,
+                amount: Number(amount),
+                currency,
+                date: serverTimestamp(),
+                userId,
+                note,
+              });
+            } catch (e) {
+              console.error("Error adding expense: ", e);
+            }
+          }, [db, userId]);
+
+          const deleteExpense = useCallback(async (expenseId) => {
+            if (!db) return;
+            const expenseDocRef = doc(db, getPublicCollectionPath('expenses'), expenseId);
+            try {
+              await deleteDoc(expenseDocRef);
+            } catch (e) {
+              console.error("Error deleting expense: ", e);
+            }
+          }, [db]);
+
+          // Calculate Total Expenses
+          const totalExpenses = useMemo(() => {
+            const totals = expenses.reduce((acc, expense) => {
+              const currency = expense.currency || 'TWD';
+              acc[currency] = (acc[currency] || 0) + expense.amount;
+              return acc;
+            }, {});
+
+            return Object.entries(totals).map(([currency, amount]) =>
+              `${currency} ${amount.toFixed(2)}`
+            ).join(' / ');
+          }, [expenses]);
+
+          // --- Initial Data Seeding from PDF ---
+          useEffect(() => {
+            if (isAuthReady && db && userId && !dataInitialized && itineraries.length === 0) {
+              console.log("Seeding initial data...");
+
+              const initialItineraries = [
+                {
+                  dayNumber: 1,
+                  title: '抵達與市區探索 (那覇市/豊見市/糸満市)',
+                  activities: [
+                    { time: '09:20', name: '抵達那霸機場 (OKA) / 出關領行李', location: '那霸國際機場' },
+                    { time: '10:00', name: '搭乘接駁車至車行 (國內航廈1F 10-A月台)', location: '那霸機場' },
+                    { time: '11:00', name: '取車 (詳閱取車說明)', location: 'OTS 租車行' },
+                    { time: '11:30', name: '午餐 - 糸滿魚市場 / 肉御殿 糸満本店', location: '豊見市/糸満市' },
+                    { time: '12:30', name: '沖繩世界玉泉洞 (KKday門票已購買)', location: '沖繩世界玉泉洞' },
+                    { time: '15:30', name: '奧武島 - 中本天婦羅', location: '奥武島' },
+                    { time: '17:30', name: 'Check in - Villa Awase 111', location: '泡瀨市 (Mapcode: 33 565 178*52)' },
+                    { time: '19:30', name: '晚餐 - 燒肉 比嘉家 / 沖縄そば専門店', location: '泡瀨市' },
+                    { time: '21:00', name: 'AEON 具志川 (採購明天早餐)', location: 'AEON 具志川' },
+                  ],
+                },
+                {
+                  dayNumber: 2,
+                  title: '中部海邊與北部水族館 (宇流麻市/名護市)',
+                  activities: [
+                    { time: '07:30', name: '飯店早餐 (前一天購置)', location: '' },
+                    { time: '08:30', name: '勝連城跡 (KLOOK Fun Pass)', location: '勝連城跡' },
+                    { time: '10:30', name: '浜比嘉島', location: '浜比嘉島' },
+                    { time: '12:00', name: '午餐 - 沖縄そば うるま製麺 / King Tacos', location: '宇流麻市' },
+                    { time: '14:00', name: '沖繩美麗海水族館 (KLOOK Fun Pass)', location: '美麗海水族館' },
+                    { time: '15:00', name: '鯨鯊餵食秀', location: '美麗海水族館' },
+                    { time: '17:00', name: '海豚劇場', location: '美麗海水族館' },
+                    { time: '17:30', name: 'Check in - New Normal Hotel in NAGO', location: '名護市' },
+                    { time: '19:30', name: '晚餐 - 燒肉乃我那覇 本店 / 燒肉五苑 / 我部祖河食堂', location: '名護市' },
+                    { time: '21:00', name: '名護夜景 (天上展望台)', location: '名護市' },
+                  ],
+                },
+                {
+                  dayNumber: 3,
+                  title: '西海岸文化體驗與日落 (恩納村/讀谷村)',
+                  activities: [
+                    { time: '06:30', name: '起床 / 準備出發', location: '' },
+                    { time: '07:00', name: 'Paanilani 鬆餅 (搶第一波)', location: '恩納村' },
+                    { time: '08:30', name: '萬座毛 / 恩納海岸公園', location: '恩納村' },
+                    { time: '11:00', name: '午餐 - 海鮮料理 浜の家', location: '恩納村' },
+                    { time: '12:30', name: '琉球村 (KLOOK Fun Pass) / 琉球舞表演', location: '琉球村' },
+                    { time: '13:30', name: '琉球村 - 風獅爺畫畫 (預約)', location: '琉球村' },
+                    { time: '14:00', name: '琉球村 - 太鼓表演', location: '琉球村' },
+                    { time: '15:00', name: 'Check in - 星野阿利維亞日光酒店', location: '讀谷村' },
+                    { time: '16:00', name: 'BANTA CAFE - 散步看夕陽', location: '讀谷村' },
+                    { time: '19:30', name: '晚餐 - Mintama義式餐酒館', location: '讀谷村' },
+                  ],
+                },
+                {
+                  dayNumber: 4,
+                  title: '美軍基地與購物 (嘉手納/浦添市/北谷町/那覇市)',
+                  activities: [
+                    { time: '07:30', name: '飯店早餐 (琉球溫泉瀨長島酒店)', location: '' },
+                    { time: '10:30', name: '道の駅かでな (拍飛機)', location: '道の駅かでな' },
+                    { time: '13:30', name: '午餐 - Ａ&Ｗ牧港店 (美國漢堡) / Houki Boshi (可麗露)', location: '浦添市' },
+                    { time: '15:00', name: '回到那霸 - 沖繩媳婦 / 波上宮', location: '那覇市' },
+                    { time: '16:00', name: 'Check in - 琉球溫泉瀨長島酒店', location: '瀨長島' },
+                    { time: '16:30', name: '美國村 (生日禮物採購)', location: '北谷町' },
+                    { time: '19:00', name: '晚餐 - 刷刷鍋NAKAMA (阿古豬/石垣牛)', location: '國際通' },
+                  ],
+                },
+                {
+                  dayNumber: 5,
+                  title: '最終採購與返家 (那覇市)',
+                  activities: [
+                    { time: '07:30', name: '飯店早餐 (Buffet)', location: '' },
+                    { time: '10:30', name: '國際通再一次', location: '國際通' },
+                    { time: '11:00', name: '幸福鬆餅 (搶第一波)', location: '國際通附近' },
+                    { time: '12:00', name: '午餐 - ポーたま 牧志市場店', location: '牧志市場' },
+                    { time: '14:00', name: 'OTS 租車行 - 還車', location: 'OTS 租車行' },
+                    { time: '14:30', name: '那霸國際機場 (OKA) Check in', location: '那霸國際機場' },
+                    { time: '16:30', name: 'Okinawa Outlet Mall Ashibinaa (候機前最後採購)', location: 'Outlet Mall Ashibinaa' },
+                    { time: '17:25', name: '返家 (STARLUX JX166 沖繩 OKA → 台中 RMQ)', location: '' },
+                  ],
+                },
+              ];
+
+              const initialExpenses = [
+                { description: '機票 (TPE-OKA, OKA-RMQ)', amount: 0, currency: 'TWD', note: 'Tiger Air IT230 & STARLUX JX166' },
+                { description: '租車', amount: 0, currency: 'JPY', note: '未填寫金額' },
+                { description: '住宿 D1 (Villa Awase 111)', amount: 0, currency: 'JPY', note: '泡瀨市 (Mapcode: 33 565 178*52)' },
+                { description: '住宿 D2 (New Normal Hotel in NAGO)', amount: 0, currency: 'JPY', note: '名護市' },
+                { description: '住宿 D3 (星野阿利維亞日光酒店)', amount: 0, currency: 'JPY', note: '讀谷村' },
+                { description: '住宿 D4 (琉球溫泉瀨長島酒店)', amount: 0, currency: 'JPY', note: '瀨長島' },
+              ];
+
+              const seedData = async () => {
+                const promises = [];
+                for (const plan of initialItineraries) {
+                  promises.push(addDailyPlan(plan.dayNumber, plan.title, plan.activities));
+                }
+
+                for (const expense of initialExpenses) {
+                  promises.push(addExpense(expense.description, expense.amount, expense.currency, expense.note));
+                }
+
+                try {
+                  await Promise.all(promises);
+                  console.log("Initial data seeding complete.");
+                } catch (e) {
+                  console.error("Failed to seed initial data:", e);
+                }
+              };
+
+              if (itineraries.length === 0) {
+                seedData();
+              }
+            }
+          }, [isAuthReady, db, userId, dataInitialized, itineraries, addDailyPlan, addExpense]);
+
+
+          // --- UI Components ---
+
+          const ItineraryPlanner = () => {
+            const [dayNumber, setDayNumber] = useState(itineraries.length > 0 ? itineraries[itineraries.length - 1].dayNumber + 1 : 1);
+            const [dayTitle, setDayTitle] = useState('');
+            const [newActivity, setNewActivity] = useState({ planId: '', time: '09:00', name: '', location: '' });
+
+            const handleAddPlan = (e) => {
+              e.preventDefault();
+              if (dayTitle && dayNumber > 0) {
+                addDailyPlan(dayNumber, dayTitle);
+                setDayTitle('');
+                setDayNumber(prev => prev + 1);
+              }
+            };
+
+            const handleAddActivity = (e) => {
+              e.preventDefault();
+              if (newActivity.planId && newActivity.name && newActivity.time) {
+                addActivityToPlan(newActivity.planId, newActivity.time, newActivity.name, newActivity.location);
+                setNewActivity(prev => ({ ...prev, name: '', location: '' }));
+              }
+            };
+
+            const generateLink = (type, location) => {
+              const encodedLocation = encodeURIComponent(location);
+              if (type === 'transit') {
+                return `https://www.google.com/maps/dir/?api=1&travelmode=transit&destination=${encodedLocation}`;
+              } else if (type === 'navigate') {
+                return `https://www.google.com/maps/search/?api=1&query=${encodedLocation}`;
+              }
+              return '#';
+            };
+
+            return (
+              <div className="space-y-6">
+                {/* Add New Day Form */}
+                <div className="bg-white p-4 rounded-xl shadow-lg">
+                  <h3 className="text-xl font-bold text-gray-800 mb-3">新增每日行程</h3>
+                  <form onSubmit={handleAddPlan} className="space-y-3">
+                    <div className="flex items-center space-x-2">
+                      <input
+                        type="number"
+                        min="1"
+                        value={dayNumber}
+                        onChange={(e) => setDayNumber(Number(e.target.value))}
+                        className="w-16 p-2 border border-gray-300 rounded-lg text-center"
+                        placeholder="Day"
+                      />
+                      <input
+                        type="text"
+                        value={dayTitle}
+                        onChange={(e) => setDayTitle(e.target.value)}
+                        className="flex-grow p-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
+                        placeholder="例如: 第六天 - 額外探索"
+                        required
+                      />
+                    </div>
+                    <button
+                      type="submit"
+                      className="w-full bg-indigo-600 text-white p-3 rounded-xl hover:bg-indigo-700 transition duration-150 flex items-center justify-center font-semibold shadow-md"
+                    >
+                      <Plus size={20} className="mr-2" />
+                      新增行程日
+                    </button>
+                  </form>
+                </div>
+
+                {/* Itinerary List */}
+                <h2 className="text-2xl font-extrabold text-gray-900 mt-8 mb-4">行程列表</h2>
+                <div className="space-y-6">
+                  {itineraries.length === 0 ? (
+                    <p className="text-gray-500 text-center p-4 bg-white rounded-xl shadow">
+                      尚未有行程，請新增行程日！
+                    </p>
+                  ) : (
+                    itineraries.map((plan) => (
+                      <div key={plan.id} className="bg-white p-4 rounded-xl shadow-2xl border-t-4 border-indigo-500">
+                        <div className="flex justify-between items-center mb-4">
+                          <h3 className="text-xl font-bold text-gray-800">
+                            Day {plan.dayNumber}：{plan.title}
+                          </h3>
+                          <button
+                            onClick={() => deleteItinerary(plan.id)}
+                            className="p-2 text-red-500 hover:bg-red-100 rounded-full transition duration-150"
+                            aria-label={`刪除行程日 ${plan.dayNumber}`}
+                          >
+                            <Trash2 size={20} />
+                          </button>
+                        </div>
+
+                        {/* Activity List */}
+                        <div className="space-y-3 border-l-2 border-gray-200 pl-4">
+                          {plan.activities.length === 0 ? (
+                            <p className="text-sm text-gray-400">當日行程空白。</p>
+                          ) : (
+                            plan.activities.map((activity, index) => (
+                              <div key={activity.id} className="relative pb-4">
+                                <div className="absolute w-3 h-3 bg-indigo-500 rounded-full -left-5 top-1"></div>
+                                <p className="text-sm font-semibold text-indigo-600">{activity.time}</p>
+                                <p className="text-lg font-medium text-gray-900">{activity.name}</p>
+                                {activity.location && (
+                                  <p className="text-sm text-gray-600 italic">地點: {activity.location}</p>
+                                )}
+                                <div className="flex space-x-2 mt-2">
+                                  {activity.location && (
+                                    <a
+                                      href={generateLink('transit', activity.location)}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="text-xs bg-green-100 text-green-700 font-semibold px-3 py-1 rounded-full flex items-center hover:bg-green-200 transition"
+                                    >
+                                      <Bus size={14} className="mr-1" />
+                                      公共交通
+                                    </a>
+                                  )}
+                                  {activity.location && (
+                                    <a
+                                      href={generateLink('navigate', activity.location)}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="text-xs bg-blue-100 text-blue-700 font-semibold px-3 py-1 rounded-full flex items-center hover:bg-blue-200 transition"
+                                    >
+                                      <Compass size={14} className="mr-1" />
+                                      導航
+                                    </a>
+                                  )}
+                                </div>
+                              </div>
+                            ))
+                          )}
+                        </div>
+
+                        {/* Add Activity Form for this day */}
+                        <form
+                          onSubmit={handleAddActivity}
+                          className="mt-4 pt-4 border-t border-gray-100 space-y-2"
+                          onFocus={() => setNewActivity(prev => ({ ...prev, planId: plan.id }))} 
+                        >
+                          <input type="hidden" value={plan.id} onChange={() => {}} />
+                          <h4 className="text-md font-semibold text-gray-700">新增活動至此日</h4>
+                          <div className="flex space-x-2">
+                            <input
+                              type="time"
+                              value={newActivity.planId === plan.id ? newActivity.time : '09:00'}
+                              onChange={(e) => setNewActivity({ ...newActivity, planId: plan.id, time: e.target.value })}
+                              className="p-2 border border-gray-300 rounded-lg w-24"
+                              required
+                            />
+                            <input
+                              type="text"
+                              value={newActivity.planId === plan.id ? newActivity.name : ''}
+                              onChange={(e) => setNewActivity({ ...newActivity, planId: plan.id, name: e.target.value })}
+                              className="flex-grow p-2 border border-gray-300 rounded-lg"
+                              placeholder="活動名稱 (例如: 參觀博物館)"
+                              required
+                            />
+                          </div>
+                          <input
+                            type="text"
+                            value={newActivity.planId === plan.id ? newActivity.location : ''}
+                            onChange={(e) => setNewActivity({ ...newActivity, planId: plan.id, location: e.target.value })}
+                            className="w-full p-2 border border-gray-300 rounded-lg"
+                            placeholder="地點/地址 (用於導航)"
+                          />
+                          <button
+                            type="submit"
+                            disabled={newActivity.planId !== plan.id || !newActivity.name}
+                            className="w-full bg-gray-200 text-gray-700 p-2 rounded-xl text-sm hover:bg-gray-300 transition disabled:opacity-50"
+                          >
+                            新增活動
+                          </button>
+                        </form>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            );
+          };
+
+          const ExpenseTracker = () => {
+            const [description, setDescription] = useState('');
+            const [amount, setAmount] = useState('');
+            const [currency, setCurrency] = useState('TWD');
+            const [note, setNote] = useState(''); 
+
+            const handleAddExpense = (e) => {
+              e.preventDefault();
+              if (description && amount > 0) {
+                addExpense(description, amount, currency, note); 
+                setDescription('');
+                setAmount('');
+                setNote('');
+              }
+            };
+
+            return (
+              <div className="space-y-6">
+                {/* Add Expense Form */}
+                <div className="bg-white p-4 rounded-xl shadow-lg">
+                  <h3 className="text-xl font-bold text-gray-800 mb-3">新增支出項目</h3>
+                  <form onSubmit={handleAddExpense} className="space-y-3">
+                    <input
+                      type="text"
+                      value={description}
+                      onChange={(e) => setDescription(e.target.value)}
+                      className="w-full p-2 border border-gray-300 rounded-lg"
+                      placeholder="支出描述 (例如: 午餐費用, 門票)"
+                      required
+                    />
+                    <div className="flex space-x-2">
+                      <select
+                        value={currency}
+                        onChange={(e) => setCurrency(e.target.value)}
+                        className="p-2 border border-gray-300 rounded-lg w-1/4"
+                      >
+                        <option value="TWD">TWD</option>
+                        <option value="USD">USD</option>
+                        <option value="JPY">JPY</option>
+                        <option value="EUR">EUR</option>
+                        <option value="CNY">CNY</option>
+                      </select>
+                      <input
+                        type="number"
+                        value={amount}
+                        onChange={(e) => setAmount(e.target.value)}
+                        className="flex-grow p-2 border border-gray-300 rounded-lg"
+                        placeholder="金額"
+                        min="0.01"
+                        step="0.01"
+                        required
+                      />
+                    </div>
+                    <input
+                      type="text"
+                      value={note}
+                      onChange={(e) => setNote(e.target.value)}
+                      className="w-full p-2 border border-gray-300 rounded-lg"
+                      placeholder="備註 (選填)"
+                    />
+                    <button
+                      type="submit"
+                      className="w-full bg-teal-600 text-white p-3 rounded-xl hover:bg-teal-700 transition duration-150 flex items-center justify-center font-semibold shadow-md"
+                    >
+                      <Plus size={20} className="mr-2" />
+                      記錄支出
+                    </button>
+                  </form>
+                </div>
+
+                {/* Expense Summary */}
+                <div className="bg-green-50 p-4 rounded-xl shadow-md border-2 border-teal-500">
+                  <h2 className="text-lg font-bold text-teal-800">總計支出</h2>
+                  <p className="text-3xl font-extrabold text-teal-600 mt-1">{totalExpenses || 'TWD 0.00'}</p>
+                  <p className="text-sm text-gray-600 mt-2">（所有貨幣總和）</p>
+                </div>
+
+                {/* Expense List */}
+                <h2 className="text-2xl font-extrabold text-gray-900 mt-8 mb-4">支出列表</h2>
+                <div className="space-y-3">
+                  {expenses.length === 0 ? (
+                    <p className="text-gray-500 text-center p-4 bg-white rounded-xl shadow">
+                      尚未記錄任何支出。
+                    </p>
+                  ) : (
+                    expenses.slice().sort((a, b) => b.date?.seconds - a.date?.seconds).map((expense) => (
+                      <div key={expense.id} className="flex items-center justify-between bg-white p-3 rounded-xl shadow-sm border border-gray-100">
+                        <div className="flex-grow">
+                          <p className="font-semibold text-gray-900">{expense.description}</p>
+                          {expense.note && <p className="text-xs text-gray-500 italic">備註: {expense.note}</p>} 
+                          <p className="text-sm text-gray-500">
+                            {expense.date ? new Date(expense.date.seconds * 1000).toLocaleDateString() : 'N/A'}
+                          </p>
+                        </div>
+                        <div className="flex items-center space-x-2">
+                          <p className="font-bold text-lg text-teal-600">
+                            {expense.currency} {expense.amount.toFixed(2)}
+                          </p>
+                          <button
+                            onClick={() => deleteExpense(expense.id)}
+                            className="p-1 text-red-400 hover:bg-red-100 rounded-full"
+                            aria-label={`刪除支出 ${expense.description}`}
+                          >
+                            <Trash2 size={18} />
+                          </button>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            );
+          };
+
+          // --- Main Render ---
+          if (error) {
+            return (
+              <div className="flex items-center justify-center min-h-screen bg-red-50 p-4">
+                <div className="p-6 bg-white rounded-xl shadow-lg border border-red-300">
+                  <h1 className="text-2xl font-bold text-red-600">應用程式錯誤</h1>
+                  <p className="mt-2 text-red-800">{error}</p>
+                </div>
+              </div>
+            );
+          }
+
+          if (loading || !isAuthReady) {
+            return (
+              <div className="flex items-center justify-center min-h-screen bg-gray-50">
+                <div className="animate-spin rounded-full h-10 w-10 border-t-2 border-b-2 border-indigo-500"></div>
+                <p className="ml-4 text-indigo-600">載入中...</p>
+              </div>
+            );
+          }
+
+          return (
+            <div className="min-h-screen bg-gray-50 font-sans">
+              <div 
+                className="relative h-40 w-full bg-cover bg-center flex items-end" 
+                style={{ backgroundImage: `url(${OKINAWA_BANNER_URL})`, backgroundSize: 'cover' }}
+                role="img"
+                aria-label={OKINAWA_BANNER_ALT}
+              >
+                <div className="absolute inset-0 bg-black bg-opacity-30"></div>
+                <div className="p-6 relative z-10 w-full">
+                    <h2 className="text-3xl font-extrabold text-white text-shadow-md">沖繩五日遊</h2>
+                    <p className="text-sm text-indigo-100 mt-1 font-medium">Jason & Yi-Ting 的甜蜜之旅</p>
+                </div>
+              </div>
+              
+              <header className="sticky top-0 bg-white shadow-md z-10 border-t-4 border-indigo-600">
+                <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex items-center justify-between">
+                  <h1 className="text-xl font-extrabold text-gray-800 flex items-center">
+                    <Map className="w-5 h-5 mr-1 text-indigo-600" />
+                    旅程儀表板
+                  </h1>
+
+                  <nav className="hidden sm:flex space-x-4">
+                    <button
+                      onClick={() => setView('itinerary')}
+                      className={`p-2 rounded-lg font-medium transition ${view === 'itinerary' ? 'bg-indigo-100 text-indigo-700 shadow' : 'text-gray-600 hover:bg-gray-100'}`}
+                    >
+                      <ListChecks className="inline w-5 h-5 mr-1" />
+                      行程規劃
+                    </button>
+                    <button
+                      onClick={() => setView('expenses')}
+                      className={`p-2 rounded-lg font-medium transition ${view === 'expenses' ? 'bg-teal-100 text-teal-700 shadow' : 'text-gray-600 hover:bg-gray-100'}`}
+                    >
+                      <DollarSign className="inline w-5 h-5 mr-1" />
+                      記帳系統
+                    </button>
+                  </nav>
+
+                  <button
+                    className="sm:hidden p-2 text-gray-600 hover:bg-gray-100 rounded-lg transition"
+                    onClick={() => setIsMenuOpen(!isMenuOpen)}
+                  >
+                    <Menu className="w-6 h-6" />
+                  </button>
+                </div>
+
+                {isMenuOpen && (
+                  <div className="sm:hidden bg-white border-t border-gray-100 shadow-lg pb-2">
+                    <button
+                      onClick={() => { setView('itinerary'); setIsMenuOpen(false); }}
+                      className={`block w-full text-left px-6 py-2 font-medium transition ${view === 'itinerary' ? 'bg-indigo-50 text-indigo-700' : 'text-gray-600 hover:bg-gray-100'}`}
+                    >
+                      <ListChecks className="inline w-5 h-5 mr-2" />
+                      行程規劃
+                    </button>
+                    <button
+                      onClick={() => { setView('expenses'); setIsMenuOpen(false); }}
+                      className={`block w-full text-left px-6 py-2 font-medium transition ${view === 'expenses' ? 'bg-teal-50 text-teal-700' : 'text-gray-600 hover:bg-gray-100'}`}
+                    >
+                      <DollarSign className="inline w-5 h-5 mr-2" />
+                      記帳系統
+                    </button>
+                  </div>
+                )}
+              </header>
+
+              <main className="max-w-4xl mx-auto p-4 sm:p-6 lg:p-8">
+                <p className="text-sm text-gray-500 mb-4 truncate">
+                  您的使用者 ID (分享此 ID 可協同編輯): <span className="font-mono text-gray-700">{userId}</span>
+                </p>
+                
+                {view === 'itinerary' ? <ItineraryPlanner /> : <ExpenseTracker />}
+              </main>
+
+              <footer className="py-6 text-center text-gray-500 text-sm border-t mt-8">
+                  <p>行程資料與記帳系統皆儲存在 Firestore，支援多人協同作業。</p>
+              </footer>
+            </div>
+          );
+        };
+
+        // 渲染 App
+        const container = document.getElementById('root');
+        const root = ReactDOM.createRoot(container);
+        root.render(<App />);
+    </script>
+</body>
+</html>
